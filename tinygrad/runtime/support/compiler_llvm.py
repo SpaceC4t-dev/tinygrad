@@ -82,7 +82,7 @@ class CPULLVMCompiler(LLVMCompiler):
 class AMDLLVMCompiler(LLVMCompiler):
   def __init__(self, arch: str):
     self.arch = arch
-    super().__init__("AMDGPU", self.arch, "+cumode")
+    super().__init__("AMDGPU", self.arch, "+cumode" if not arch.startswith("gfx9") else "") # cumode is gfx10+
   def __reduce__(self): return (AMDLLVMCompiler, (self.arch,))
   def compile(self, src:str) -> bytes:
     try: return super().compile(src)

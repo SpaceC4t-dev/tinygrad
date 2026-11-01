@@ -12,9 +12,9 @@ fw_src="https://gitlab.com/kernel-firmware/linux-firmware/-/archive/0a6871b19abf
 pmc_src="https://raw.githubusercontent.com/ROCm/rocm-systems/cccc350dc620e61ae2554978b62ab3532dc10bd9/projects/rocprofiler-compute/src/rocprof_compute_soc/profile_configs/counter_defs.yaml"
 
 reg_files = {
-  "gc": [(9,4,3), (11,0,0), (11,0,3), (11,5,0), (12,0,0)],
+  "gc": [(9,0), (9,4,3), (11,0,0), (11,0,3), (11,5,0), (12,0,0)],
   "mmhub": [(1,8,0), (3,0,0), (3,0,1), (3,0,2), (3,3,0), (4,1,0)],
-  "nbio": [(4,3,0), (7,2,0), (7,7,0), (7,9,0), (7,11,0)], "nbif": [(6,3,1)],
+  "nbio": [(4,3,0), (7,0), (7,2,0), (7,7,0), (7,9,0), (7,11,0)], "nbif": [(6,3,1)],
   "mp": [(11,0,0), (13,0,0), (14,0,2)], "hdp": [(4,4,2), (6,0,0), (7,0,0)],
   "osssys": [(4,4,2), (6,0,0), (6,1,0), (7,0,0)], "sdma": [(4,4,2)]
 }
@@ -24,7 +24,8 @@ reg_patterns = {
          "(SQ|GL2C|TCC)_PERFCOUNTER", "SQ_THREAD_TRACE", "SPI_(CONFIG_CNTL|COMPUTE_QUEUE_RESET)", "GRBM", "SH_MEM", "RLC", "TCP", "GB_ADDR_CONFIG",
          "SDMA[01]_(WATCHDOG_CNTL|UTCL1_(CNTL|PAGE)|MCU_CNTL|F32_CNTL|CNTL|QUEUE0_|RLC_CGCG_CTRL)", "SCRATCH_REG[0-35-7]"],
   "mmhub": ["MMVM", "MMMC_VM", "MM_ATC_L2_MISC_CG"],
-  "nbio": (nbio:=["BIF_BX_PF[01]_GPU_HDP_FLUSH", "BIF_BX_PF0_RSMU", "BIF_BX0_(REMAP_HDP_MEM_FLUSH_CNTL|BIF_DOORBELL_INT_CNTL|PCIE_INDEX2|PCIE_DATA2)",
+  "nbio": (nbio:=["BIF_BX_PF[01]_GPU_HDP_FLUSH", "GPU_HDP_FLUSH", "BIF_BX_PF0_RSMU",
+                  "BIF_BX0_(REMAP_HDP_MEM_FLUSH_CNTL|BIF_DOORBELL_INT_CNTL|PCIE_INDEX2|PCIE_DATA2)",
                   "BIFC_(DOORBELL_ACCESS_EN_PF|GFX_INT_MONITOR_MASK)", "XCC_DOORBELL_FENCE", "DOORBELL0_CTRL_ENTRY", "GDC_S2A0_S2A_DOORBELL_ENTRY",
                   "S2A_DOORBELL_ENTRY", "RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN",
                   "BIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL", "RCC_DEV0_EPF2_STRAP2"]),
@@ -74,7 +75,8 @@ def __getattr__(nm):
           # handle CDNA's different register names
           def normalize(reg):
             return s[0] + prefix.upper()[:2] + s[1] if prefix in ("gc", "mmhub") and (s:=split_name(reg))[1].startswith(("VM_", "MC_VM_")) else reg
-          def extract(lines, pat): return ((normalize(m.group(1)), int(m.group(2), 0)) for l in lines if (m:=re.match(pat, l)))
+          def rename(reg): return re.sub(r'^mm', 'reg', reg) if prefix in ("gc", "nbio") else reg # gc 9.0 and nbio 7.0 use the old mm prefix
+          def extract(lines, pat): return ((normalize(rename(m.group(1))), int(m.group(2), 0)) for l in lines if (m:=re.match(pat, l)))
 
           offset, sh_mask = pathlib.Path(f"{file}_offset.h").read_text().splitlines(), pathlib.Path(f"{file}_sh_mask.h").read_text().splitlines()
           defs = {k:v for k,v in extract(offset, r'#define\s+((?:mm|reg)\S+)\s+(0x[\da-fA-F]+|\d+)') if any(re.match("(mm|reg)"+p, k) for p in pats)}

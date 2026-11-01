@@ -96,7 +96,10 @@ amd_cdna3_161632 = [mfma(32,di,dtypes.float) for di in [dtypes.fp8e5m2fnuz, dtyp
 amd_cdna3 = amd_cdna3_161632 + amd_cdna_161616
 amd_cdna4 = amd_cdna_1616128 + amd_cdna_161632 + amd_cdna_161616
 
-def get_amd(arch): return {"gfx942": amd_cdna3, "gfx950": amd_cdna4, "gfx1200": amd_rdna4, "gfx1201": amd_rdna4}.get(arch, amd_rdna3)
+def get_amd(arch):
+  # pre-cdna gfx9 (eg. gfx90c) has no matrix cores
+  return {"gfx942": amd_cdna3, "gfx950": amd_cdna4, "gfx1200": amd_rdna4, "gfx1201": amd_rdna4}.get(arch,
+          amd_rdna3 if arch.startswith("gfx11") else [])
 
 pm_validate_wmma_rdna3 = PatternMatcher([
   (UPat(Ops.WMMA, name="x", dtype=dtypes.int32), lambda x: x.replace(

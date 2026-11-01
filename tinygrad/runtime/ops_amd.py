@@ -379,9 +379,11 @@ class AMDComputeQueue(HWQueue):
     scratch_addr = UOp.alloc((data.private_segment_size,), dtypes.uint8, 0, device=self.devs[0], name="scratch").getaddr(self.devs)
 
     user_regs:list = []
-    if data.enable_private_segment_sgpr: user_regs = [scratch_addr | (1 << 63), 0xffffffff, 0x20c14000]
+    # user sgprs in hsa order: private segment buffer, dispatch ptr, kernarg ptr, flat scratch init (pre gfx940, no architected flat scratch)
+    if data.enable_private_segment_sgpr: user_regs = [scratch_addr | (1 << 63), 0xffffffff, 0x00ea4fac if self.target[0] == 9 else 0x20c14000]
     if data.enable_dispatch_ptr: user_regs += [args_addr + data.kernargs_segment_size]
     user_regs += [args_addr]
+    if data.enable_flat_scratch_init: user_regs += [scratch_addr] # the wave's offset is added by the kernel prolog
 
     dispatch_init = self.gc.regCOMPUTE_DISPATCH_INITIATOR.encode(
       **({'cs_w32_en': int(data.wave32)} if self.target[0] != 9 else {}), force_start_at_000=1, compute_shader_en=1)
@@ -390,7 +392,7 @@ class AMDComputeQueue(HWQueue):
     if self.dev.prof_enabled: slot = self.prof_start(prg.arg, lib)
     self.wreg(self.gc.regCOMPUTE_PGM_LO, prog_addr >> 8)
     self.wreg(self.gc.regCOMPUTE_PGM_RSRC1, data.rsrc1, data.rsrc2)
-    self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, data.rsrc3)
+    if 'regCOMPUTE_PGM_RSRC3' in self.gc.regs: self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, data.rsrc3) # gfx90a+
     self.wreg(self.gc.regCOMPUTE_TMPRING_SIZE, self.dev.tmpring_size(data.private_segment_size))
     for xcc_id in range(self.dev.xccs): # architected flat scratch: each xcc gets its part
       with self.pred_exec(xcc_mask=1 << xcc_id):
@@ -509,7 +511,7 @@ class AMDSDMAQueue(HWQueue):
 class AMDProgramData:
   desc_offset:int; entry_point_offset:int; rsrc1:int; rsrc2:int; rsrc3:int; wave32:bool # noqa: E702
   private_segment_size:int; group_segment_size:int; kernargs_segment_size:int # noqa: E702
-  enable_dispatch_ptr:int; enable_private_segment_sgpr:int # noqa: E702
+  enable_dispatch_ptr:int; enable_private_segment_sgpr:int; enable_flat_scratch_init:int # noqa: E702
 
 def amd_build_program(dev, prg:UOp, devs:tuple[str, ...]) -> tuple[AMDProgramData, UOp]:
   data, image = _amd_program_image(dev, prg.src[3].arg)
@@ -533,7 +535,8 @@ def _amd_program_image(dev, lib:bytes) -> tuple[AMDProgramData, bytes]:
     rsrc2=desc.compute_pgm_rsrc2 | (lds<<15), rsrc3=desc.compute_pgm_rsrc3, wave32=bool(desc.kernel_code_properties & 0x400),
     private_segment_size=desc.private_segment_fixed_size,
     group_segment_size=desc.group_segment_fixed_size, kernargs_segment_size=desc.kernarg_size, enable_dispatch_ptr=edp,
-    enable_private_segment_sgpr=desc.kernel_code_properties & hsa.AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER)
+    enable_private_segment_sgpr=desc.kernel_code_properties & hsa.AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER,
+    enable_flat_scratch_init=desc.kernel_code_properties & hsa.AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_FLAT_SCRATCH_INIT)
   return data, bytes(image).ljust(round_up(len(image), 4), b"\x00") # the program is uploaded as whole dwords
 
 class AMDAllocator(Allocator['AMDDevice']):
@@ -832,7 +835,7 @@ class AMDDevice(Compiled):
 
     self.target:tuple[int, ...] = ((trgt:=self.iface.props['gfx_target_version']) // 10000, (trgt // 100) % 100, trgt % 100)
     self.arch = "gfx%d%x%x" % self.target
-    assert (self.target in ((9,4,2),(9,5,0))) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
+    assert (self.target in ((9,0,12),(9,4,2),(9,5,0))) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
     if DEBUG >= 1: print(f"AMDDevice: opening {self.device_id} with target {self.target} arch {self.arch}")
 
     self.xccs = self.iface.props.get('num_xcc', 1)
@@ -850,8 +853,9 @@ class AMDDevice(Compiled):
 
     self.nbio = AMDIP('nbio' if self.target[0] < 12 else 'nbif', self.iface.ip_versions[am.NBIF_HWIP],
                       bases={i: tuple(getattr(self.ip_off, f'NBIO_BASE__INST{i}_SEG{s}', 0) for s in range(9)) for i in range(6)})
-    pf = '' if self.nbio.version[0] == 2 else '0' if self.nbio.version[:2] != (7, 11) else '1'
-    self.hdp_flush = getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_REQ'), getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_DONE')
+    pf = 'BIF_BX_PF_' if self.nbio.version[0] == 2 else 'BIF_BX_PF0_' if self.nbio.version[:2] != (7, 11) else 'BIF_BX_PF1_'
+    if self.nbio.version[:2] == (2, 5): pf = '' # renoir's nbif 2.5 is nbio 7.0
+    self.hdp_flush = getattr(self.nbio, f'reg{pf}GPU_HDP_FLUSH_REQ'), getattr(self.nbio, f'reg{pf}GPU_HDP_FLUSH_DONE')
 
     self.is_aql = getenv("AMD_AQL", int(self.xccs > 1))
     self.max_copy_size = 0x40000000 if (4, 4, 2) <= (v:=self.iface.ip_versions[am.SDMA0_HWIP]) < (5, 0, 0) or v >= (5, 2, 0) else 0x400000
