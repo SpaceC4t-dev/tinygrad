@@ -160,8 +160,13 @@ pm_widen_uidx = PatternMatcher([
         allow_any_len=True, name="x"), lambda x,i: x.replace(src=(x.src[0], i.cast(dtypes.int64), *x.src[2:]))),
 ])
 
+def render_blobs(uops:list[UOp]) -> list[str]:
+  return list({x.key: f"@bin_{x.key.hex()} = private constant [{len(x.arg)} x i8] c\"" + "".join("\\%02X" % b for b in x.arg) + '", align 16'
+               for x in uops if x.op is Ops.BINARY}.values())
+
 class LLVMRenderer(Renderer):
   abi: str | None
+  alloca_addrspace: int | None = None
   string_rewrite: PatternMatcher
   code_for_op = {**{k:lambda:None for v in lop.values() for k in v.keys()}, **{op: lambda: None for op in llvm_intrinsics}}
 
@@ -196,7 +201,11 @@ class LLVMRenderer(Renderer):
       elif u.op is Ops.BUFFER:
         r[u] = f"%{'local' if u.addrspace == AddrSpace.LOCAL else 'reg'}_{str(u.arg.slot)}"
         size = u.max_numel()
-        if u.addrspace == AddrSpace.REG:
+        if u.addrspace == AddrSpace.REG and self.alloca_addrspace is not None: # amdgpu allocas live in the private addrspace
+          arr = f"[{size} x {ldt(u.dtype)}]"
+          kernel.append(f"  {r[u]}_p = alloca {arr}, addrspace({self.alloca_addrspace})")
+          kernel.append(f"  {r[u]} = addrspacecast {arr} addrspace({self.alloca_addrspace})* {r[u]}_p to {arr}*")
+        elif u.addrspace == AddrSpace.REG:
           kernel.append(f"  {r[u]} = alloca [{size} x {ldt(u.dtype)}]")
         elif self.has_local:
           local_args.append(f"@{r[u][1:]} = internal unnamed_addr addrspace(3) global [{size} x {ldt(u.dtype)}] undef, align 16")
@@ -233,9 +242,7 @@ class CPULLVMRenderer(LLVMRenderer):
              for x in uops if x.op is Ops.CALL and x.src[0].op is Ops.CUSTOM_FUNCTION}
     decls |= {x.body.src[0].arg.function_name: f"declare void @{x.body.src[0].arg.function_name}({', '.join(map(lparam, x.body.arg.params))})"
               for x in uops if x.op is Ops.CALL and x.body.op is Ops.PROGRAM}
-    blobs = {x.key: f"@bin_{x.key.hex()} = private constant [{len(x.arg)} x i8] c\"" + "".join("\\%02X" % b for b in x.arg) + '", align 16'
-             for x in uops if x.op is Ops.BINARY}
-    return "\n".join([*decls.values(), *blobs.values(), 'attributes #0 = { alwaysinline nounwind "no-builtins" "no-trapping-math"="true" }'])
+    return "\n".join([*decls.values(), *render_blobs(uops), 'attributes #0 = { alwaysinline nounwind "no-builtins" "no-trapping-math"="true" }'])
   def __init__(self, target:Target):
     super().__init__(target)
     from tinygrad.runtime.support.compiler_llvm import CPULLVMCompiler
@@ -253,6 +260,7 @@ class AMDLLVMRenderer(LLVMRenderer):
   global_max = HIPRenderer.global_max
   global_prod_max = HIPRenderer.global_prod_max
   abi = "amdgpu_kernel"
+  alloca_addrspace = 5
   string_rewrite = PatternMatcher([
     (UPat(Ops.SPECIAL, name="x"), lambda ctx, x: f"  {ctx[x]} = " + f"{ code_for_workitem[x.arg[0]](x.arg[-1])}; "),
     (UPat(Ops.BARRIER), lambda ctx: barrier),
@@ -285,7 +293,7 @@ exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc
     requiredMaxThreadsPerBlock = prod([d.vmax for d in local_dims])
     attributes = ["alwaysinline", "nounwind", '"no-builtins"',
                   f'"amdgpu-flat-work-group-size"="1,{requiredMaxThreadsPerBlock}"', '"no-trapping-math"="true"']
-    return 'attributes #0 = { ' + ' '.join(attributes) + ' }'
+    return "\n".join([*render_blobs(uops), 'attributes #0 = { ' + ' '.join(attributes) + ' }'])
   @staticmethod
   def is_rdna4(arch): return arch in {'gfx1200', 'gfx1201'}
   def __init__(self, target:Target):

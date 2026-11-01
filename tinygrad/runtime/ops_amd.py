@@ -518,9 +518,10 @@ def amd_build_program(dev, prg:UOp, devs:tuple[str, ...]) -> tuple[AMDProgramDat
 def _amd_program_image(dev, lib:bytes) -> tuple[AMDProgramData, bytes]:
   image, sections, relocs = elf_loader(lib)
   rodata = next(sh.header.sh_addr for sh in sections if sh.name == ".rodata")
-  for off, sym, typ, addent in relocs:
-    assert typ == 5, f"unknown AMD reloc {typ}"  # R_AMDGPU_REL64
-    image[off:off+8] = struct.pack('<q', sym - off + addent)
+  for off, sym, typ, addent in relocs: # all pc relative: S + A - P
+    if typ == 5: image[off:off+8] = struct.pack('<q', sym - off + addent) # R_AMDGPU_REL64
+    elif typ in (10, 11): image[off:off+4] = struct.pack('<I', ((sym - off + addent) >> (32 * (typ - 10))) & 0xffffffff) # R_AMDGPU_REL32_LO/HI
+    else: raise RuntimeError(f"unknown AMD reloc {typ}")
   desc = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t.from_buffer_copy(
     bytes(image[rodata:rodata+ctypes.sizeof(amdgpu_kd.llvm_amdhsa_kernel_descriptor_t)]))
   if (lds:=((desc.group_segment_fixed_size+511)//512)&0x1FF) > (dev.iface.props['lds_size_in_kb']*1024)//512:
