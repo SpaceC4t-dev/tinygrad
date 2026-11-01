@@ -11,7 +11,7 @@ inc, kern_rules = ["-include", "stdint.h"], [(r'le32_to_cpu', ''),]
 fw_src="https://gitlab.com/kernel-firmware/linux-firmware/-/archive/0a6871b19abf5d6e024b5d208b101ae53e7fa0de/0a6871b19abf5d6e024b5d208b101ae53e7fa0de.tar.gz"
 pmc_src="https://raw.githubusercontent.com/ROCm/rocm-systems/cccc350dc620e61ae2554978b62ab3532dc10bd9/projects/rocprofiler-compute/src/rocprof_compute_soc/profile_configs/counter_defs.yaml"
 
-reg_files = {
+reg_files: dict[str, list[tuple[int, ...]]] = {
   "gc": [(9,0), (9,4,3), (11,0,0), (11,0,3), (11,5,0), (12,0,0)],
   "mmhub": [(1,8,0), (3,0,0), (3,0,1), (3,0,2), (3,3,0), (4,1,0)],
   "nbio": [(4,3,0), (7,0), (7,2,0), (7,7,0), (7,9,0), (7,11,0)], "nbif": [(6,3,1)],
