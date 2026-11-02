@@ -667,6 +667,12 @@ class KFDIface:
       ctl_stack_size=ctl_stack_size, ctx_save_restore_address=cwsr_buffer._buf if cwsr_buffer else 0, ctx_save_restore_size=ctx_save_restore_size,
       write_pointer_address=gart._buf+wptr, read_pointer_address=gart._buf+rptr+8*xcc_id)
 
+    # an apu's gpu also drives the display: a long kernel on every cu starves the gfx ring until amdgpu resets it (and our queue).
+    # keep some cus free for graphics (renoir: 1 of 6)
+    if queue_type != kfd.KFD_IOC_QUEUE_TYPE_SDMA and (reserve:=getenv("AMD_RESERVE_CUS", 1 if self.dev.target == (9,0,12) else 0)):
+      cu_mask = (ctypes.c_uint32 * 1)((1 << max(self.dev.cu_cnt - reserve, 1)) - 1)
+      kfd.AMDKFD_IOC_SET_CU_MASK(KFDIface.kfd, queue_id=queue.queue_id, num_cu_mask=32, cu_mask_ptr=ctypes.addressof(cu_mask))
+
     if not hasattr(self, 'doorbells'):
       self.doorbells_base = queue.doorbell_offset & (~0x1fff) # doorbell is two pages
       self.doorbells = cast(FileIOInterface, KFDIface.kfd).mmap(0, 0x2000, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, self.doorbells_base)
