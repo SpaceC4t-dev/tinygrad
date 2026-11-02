@@ -286,7 +286,8 @@ do_bf8: %packed_bf8 = call i32 @llvm.amdgcn.cvt.pk.bf8.f32(float %phi_val, float
 do_fp8: %packed_fp8 = call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %phi_val, float %phi_val, i32 0, i1 false)\n  br label %exit
 exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc = trunc i32 %packed to i8\n  ret i8 %trunc
 }}""".replace(": ", ":\n  ")] if has_fp8 else []
-    return "\n".join((k:=self._render_kernel(uops, prefix))[0] + (k[1], self._render_footer(uops)))
+    # LLVM 23 segfaults emitting a module without a triple
+    return "\n".join(['target triple = "amdgcn-amd-amdhsa"'] + list((k:=self._render_kernel(uops, prefix))[0]) + [k[1], self._render_footer(uops)])
   def _render_footer(self, uops: list[UOp]) -> str:
     # TODO: this is copied from cstyle
     local_dims = [u.src[0] for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]

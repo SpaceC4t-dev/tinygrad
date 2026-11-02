@@ -14,7 +14,7 @@ class LLVMCompiler(Compiler):
     for component in ['Target', 'TargetInfo', 'TargetMC', 'AsmParser', 'AsmPrinter']:
       getattr(llvm, "LLVMInitialize" + {'arm64': 'AArch64', 'x86_64': 'X86', 'riscv64': 'riscv64'}.get(arch, "AMDGPU") + component)()
 
-    self.triple = triple = {'arm64': b'aarch64-none-unknown-elf', 'x86_64': b'x86_64-none-unknown-elf', 'AMDGPU': b'amdgcn-amd-amdhsa'}[arch]
+    triple = {'arm64': b'aarch64-none-unknown-elf', 'x86_64': b'x86_64-none-unknown-elf', 'AMDGPU': b'amdgcn-amd-amdhsa'}[arch]
     target = expect(llvm.LLVMGetTargetFromTriple(triple, ctypes.pointer(tgt:=llvm.LLVMTargetRef()), err:=cerr()), err, tgt)
     if DEBUG >= 3: print(f"LLVM init for {processor!r} with {feats!r}")
     self.target_machine = llvm.LLVMCreateTargetMachine(target, triple, processor.encode(), feats.encode(),
@@ -51,7 +51,6 @@ class LLVMCompiler(Compiler):
     self.diag_msgs.clear()
     src_buf = llvm.LLVMCreateMemoryBufferWithMemoryRangeCopy(ctypes.create_string_buffer(src_bytes:=src.encode()), len(src_bytes), b'src')
     mod = expect(llvm.LLVMParseIRInContext(self.context, src_buf, ctypes.pointer(m:=llvm.LLVMModuleRef()), err:=cerr()), err, m)
-    llvm.LLVMSetTarget(mod, self.triple) # LLVM 23 crashes emitting a module without a triple
     layout = llvm.LLVMCreateTargetDataLayout(self.target_machine)
     llvm.LLVMSetModuleDataLayout(mod, layout)
     llvm.LLVMDisposeTargetData(layout)
@@ -82,7 +81,7 @@ class CPULLVMCompiler(LLVMCompiler):
 class AMDLLVMCompiler(LLVMCompiler):
   def __init__(self, arch: str):
     self.arch = arch
-    super().__init__("AMDGPU", self.arch, "+cumode" if not arch.startswith("gfx9") else "") # cumode is gfx10+
+    super().__init__("AMDGPU", self.arch, "+cumode")
   def __reduce__(self): return (AMDLLVMCompiler, (self.arch,))
   def compile(self, src:str) -> bytes:
     try: return super().compile(src)
