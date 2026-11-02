@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast, Any
-import os, ctypes, struct, functools, importlib, mmap, errno, contextlib, itertools, collections, atexit
+import os, ctypes, struct, functools, importlib, mmap, errno, contextlib, itertools, collections, atexit, time
 from dataclasses import dataclass, replace
 from tinygrad.runtime.support.hcq2 import HWQueue, encode_cmdbuf, to_name, patch, unwrap_view, layout_args, pack_args, make_program, ccall
 from tinygrad.uop.ops import sint, UOp, ProgramInfo, Ops, UPat, PatternMatcher, KernelInfo, uopfunc
@@ -74,6 +74,25 @@ def amd_sdma_submit(cmdbuf:UOp, ring:UOp, wptr:UOp, doorbell:UOp, put:UOp) -> UO
   w = wptr.after(copy).index(0).store(next_put).barrier()
   return doorbell.after(put.after(w).index(0).store(next_put)).index(0).store(next_put).sink()
 
+# **** drm: batches go through the kernel's scheduler
+
+_libc_ioctl = ctypes.CDLL(None).ioctl
+_libc_ioctl.restype = ctypes.c_int
+def _ioctl_nr(fn) -> int: return (fn.args[0] << 30) | (ctypes.sizeof(fn.args[3]) << 16) | (fn.args[1] << 8) | fn.args[2]
+
+def drm_submit(hq:HWQueue, cmdbuf:UOp, ip_type:int) -> UOp: # the cmdbuf is one ib on the kernel's ring: ioctl(fd, CS, &args)
+  iface, (base, off) = cast(DRMIface, cast(Any, hq.dev).iface), unwrap_view(cmdbuf)
+  args = UOp.alloc((80,), dtypes.uint8, device=hq.dev.host, name=to_name("drm_cs", hq.queue)) # [cs in][&chunk][chunk][ib]
+  addr = args.getaddr(hq.dev.host)
+  blob = bytes(amdgpu_drm.struct_drm_amdgpu_cs_in(ctx_id=iface.ctx_id, bo_list_handle=iface.bo_list, num_chunks=1)) + bytes(8) + \
+         bytes(amdgpu_drm.struct_drm_amdgpu_cs_chunk(chunk_id=amdgpu_drm.AMDGPU_CHUNK_ID_IB, length_dw=8)) + \
+         bytes(amdgpu_drm.struct_drm_amdgpu_cs_chunk_ib(ib_bytes=cmdbuf.max_numel(), ip_type=ip_type))
+  rows = [(16, addr + 24), (24, addr + 32), (40, addr + 48), (56, base.getaddr(hq.devs) + off)]
+  ret = ccall(_libc_ioctl, iface.fd.fd, UOp.const(_ioctl_nr(amdgpu_drm.DRM_IOCTL_AMDGPU_CS), dtypes.uint64),
+              patch(args, rows, blob).after(cmdbuf).index(0))
+  err = UOp.alloc((1,), dtypes.int64, 0, device=hq.dev.host, name=to_name(hq.dev.device, "drm_err")) # a failed submit fails the wait
+  return err.index(0).store(ret.ne(0).where(ret.cast(dtypes.int64), err.index(0).load())).sink()
+
 def _dw(vals) -> int: return sum(2 if isinstance(x, UOp) and x.dtype.itemsize == 8 else 1 for x in vals)
 
 def dispatch_packet(data:AMDProgramData, info:ProgramInfo, kernel_object:UOp=UOp.const(0, dtypes.uint64),
@@ -91,6 +110,9 @@ class AMDComputeQueue(HWQueue):
     super().__init__(submit)
     self.pm4, self.gc, self.soc, self.nbio, self.target = self.dev.pm4, self.dev.gc, self.dev.soc, self.dev.nbio, self.dev.target
     self.profiled:list[UOp] = []
+    self.drm = isinstance(self.dev.iface, DRMIface)
+    if self.drm and (reserve:=getenv("AMD_RESERVE_CUS", 1 if self.target == (9,0,12) else 0)): # no cu mask ioctl for a drm context
+      self.wreg(self.gc.regCOMPUTE_STATIC_THREAD_MGMT_SE0, (1 << max(self.dev.cu_cnt - reserve, 1)) - 1)
     if self.dev.pmc_enabled: self.pmc_start()
 
   def pkt3(self, cmd, *vals): self.q(self.pm4.PACKET3(cmd, _dw(vals) - 1), *vals)
@@ -158,6 +180,7 @@ class AMDComputeQueue(HWQueue):
     self.pkt3(self.pm4.PACKET3_RELEASE_MEM, event_dw | cache_flags_dw, memsel_dw, addr_w, val_w, ctxid)
 
   def memory_barrier(self):
+    if self.drm: return self.acquire_mem() # the kernel flushes hdp around each job
     (req, done), mask = self.dev.hdp_flush, self.dev.hdp_flush[0].fields_mask('cp2')
     self.wait_reg_mem(reg=req.addr[0], reg_done=done.addr[0], value=mask, mask=mask, op=WAIT_REG_MEM_FUNCTION_EQ)
     self.acquire_mem()
@@ -419,9 +442,11 @@ class AMDComputeQueue(HWQueue):
   def signal(self, signal:UOp, value:UOp):
     with self.pred_exec(xcc_mask=0b1):
       self.release_mem(signal.getaddr(self.devs), value, self.pm4.data_sel__mec_release_mem__send_32_bit_low,
-                       self.pm4.int_sel__mec_release_mem__send_interrupt_after_write_confirm, cache_flush=True)
+                       self.pm4.int_sel__mec_release_mem__none if self.drm else self.pm4.int_sel__mec_release_mem__send_interrupt_after_write_confirm,
+                       cache_flush=True)
 
   def submit(self, cmdbuf:UOp) -> UOp: # the ring gets an indirect buffer packet: 4 dwords, put stays aligned so it never wraps mid packet
+    if self.drm: return drm_submit(self, self.prof_bump(cmdbuf), amdgpu_drm.AMDGPU_HW_IP_COMPUTE)
     base, off = unwrap_view(cmdbuf)
     blob = struct.pack("IIII", self.pm4.PACKET3(self.pm4.PACKET3_INDIRECT_BUFFER, 2), 0, 0, cmdbuf.max_numel() // 4 | self.pm4.INDIRECT_BUFFER_VALID)
     ib = UOp.alloc((16,), dtypes.uint8, device=self.dev.host, name=to_name("ib", self.queue))
@@ -496,6 +521,7 @@ class AMDSDMAQueue(HWQueue):
   def __init__(self, submit):
     super().__init__(submit)
     self.sdma, self.target, self.max_copy_size = self.dev.sdma, self.dev.target, self.dev.max_copy_size
+    self.drm = isinstance(self.dev.iface, DRMIface)
 
   def copy(self, dst:UOp, src:UOp, sz:int):
     for off in range(0, sz, self.max_copy_size):
@@ -503,6 +529,7 @@ class AMDSDMAQueue(HWQueue):
             0, *(a + UOp.const(off, dtypes.uint64) if off else a for a in (src.getaddr(self.devs), dst.getaddr(self.devs))))
 
   def memory_barrier(self):
+    if self.drm: return # the kernel flushes hdp around each job
     (req, done), op = self.dev.hdp_flush, self.sdma.SDMA_OP_POLL_REGMEM | self.sdma.SDMA_PKT_POLL_REGMEM_HEADER_HDP_FLUSH(1)
     self.q(op | self.sdma.SDMA_PKT_POLL_REGMEM_HEADER_FUNC(WAIT_REG_MEM_FUNCTION_EQ), done.addr[0] << 2, req.addr[0] << 2,
            m:=req.fields_mask('sdma0'), m, self.sdma.SDMA_PKT_POLL_REGMEM_DW5_INTERVAL(10) | self.sdma.SDMA_PKT_POLL_REGMEM_DW5_RETRY_COUNT(0xfff))
@@ -523,11 +550,17 @@ class AMDSDMAQueue(HWQueue):
 
   def signal(self, signal:UOp, value:UOp):
     op = self.sdma.SDMA_OP_FENCE | (self.sdma.SDMA_PKT_FENCE_HEADER_MTYPE(3) if self.target[0] != 9 else 0)
-    self.q(op, signal.getaddr(self.devs), value.cast(dtypes.uint32), self.sdma.SDMA_OP_TRAP, 0)
+    self.q(op, signal.getaddr(self.devs), value.cast(dtypes.uint32), *(() if self.drm else (self.sdma.SDMA_OP_TRAP, 0))) # drm: the host polls
 
-  def submit(self, cmdbuf:UOp) -> UOp: return amd_sdma_submit(cmdbuf, *_queue_args(self, unwrap(self.dev.sdma_queue(int(self.queue.split(":")[1])))))
+  def submit(self, cmdbuf:UOp) -> UOp:
+    if self.drm: return drm_submit(self, cmdbuf, amdgpu_drm.AMDGPU_HW_IP_DMA)
+    return amd_sdma_submit(cmdbuf, *_queue_args(self, unwrap(self.dev.sdma_queue(int(self.queue.split(":")[1])))))
 
-  def encode(self) -> UOp: return self.submit(encode_cmdbuf(self, self.lin, device=self.dev.host))
+  def encode(self) -> UOp:
+    if not self.drm: return self.submit(encode_cmdbuf(self, self.lin, device=self.dev.host))
+    for u in self.lin.src: self.q_rewrite.rewrite(u, ctx=self) # drm: an ib on the gpu, padded with nops to 8 dwords
+    self.q(*[0] * (-len(self.blob) // 4 % 8))
+    return self.submit(encode_cmdbuf(self))
 
 @dataclass(frozen=True)
 class AMDProgramData:
@@ -741,6 +774,96 @@ class KFDIface:
     return inf
   def is_wgp_active(self, xcc, se, sa, wgp) -> bool: return ((self.drm_dev_info.cu_bitmap[se % 4][sa + (se // 4) * 2] >> (2 * wgp)) & 0x3) == 0x3
 
+class DRMIface:
+  """amdgpu's drm interface: batches are ibs scheduled by the kernel (DRM_AMDGPU_CS), so any number of processes share the gpu and a hang
+  resets one job. buffers are gtt gem objects mapped at their cpu address (on an apu, gtt is the same dram as vram)"""
+  count:int = 0
+
+  def __init__(self, dev, device_id):
+    self.dev, topo = dev, "/sys/devices/virtual/kfd/kfd/topology/nodes" # the kfd topology describes the gpu, /dev/kfd isn't opened
+    gpus = [g for g in FileIOInterface(topo).listdir() if KFDIface._is_usable_gpu(cast(Any, None), FileIOInterface(f"{topo}/{g}/gpu_id"))]
+    gpus = filter_visible_devices(sorted(gpus, key=lambda x: int(x.split('/')[-1])), "AMD")
+    DRMIface.count = len(gpus)
+    if device_id >= len(gpus): raise RuntimeError(f"No device found for {device_id}")
+    self.props = {(p:=l.split())[0]: int(p[1]) for l in FileIOInterface(f"{topo}/{gpus[device_id]}/properties").read().splitlines()}
+    self.dev_sysfs_path = f"/sys/class/drm/renderD{self.props['drm_render_minor']}/device"
+    ip_base = f"{self.dev_sysfs_path}/ip_discovery/die/0"
+    id2ip = {am.GC_HWID: am.GC_HWIP, am.SDMA0_HWID: am.SDMA0_HWIP, am.NBIF_HWID: am.NBIF_HWIP}
+    ip_hw = [(id2ip[int(hwid)], int(hwid)) for hwid in FileIOInterface(ip_base).listdir() if hwid.isnumeric() and int(hwid) in id2ip]
+    self.ip_versions = {ip:tuple(int(FileIOInterface(f'{ip_base}/{hw}/0/{part}').read()) for part in ['major','minor','revision']) for ip,hw in ip_hw}
+
+    self.fd = FileIOInterface(f"/dev/dri/renderD{self.props['drm_render_minor']}", os.O_RDWR)
+    ctx = amdgpu_drm.DRM_IOCTL_AMDGPU_CTX(self.fd, _in=amdgpu_drm.struct_drm_amdgpu_ctx_in(op=amdgpu_drm.AMDGPU_CTX_OP_ALLOC_CTX))
+    self.ctx_id, self.userptrs = ctx.out.alloc.ctx_id, set[int]()
+    # host memory mapped to the gpu (userptrs) can't be always valid: every submit passes this list, updated in place
+    self.bo_list = self._bo_list(amdgpu_drm.AMDGPU_BO_LIST_OP_CREATE, 0)
+
+  def _bo_list(self, op:int, handle:int) -> int:
+    entries = (amdgpu_drm.struct_drm_amdgpu_bo_list_entry * max(len(self.userptrs), 1))(*[amdgpu_drm.struct_drm_amdgpu_bo_list_entry(bo_handle=h)
+                                                                                         for h in sorted(self.userptrs)])
+    return amdgpu_drm.DRM_IOCTL_AMDGPU_BO_LIST(self.fd, _in=amdgpu_drm.struct_drm_amdgpu_bo_list_in(operation=op, list_handle=handle,
+      bo_number=len(self.userptrs), bo_info_size=ctypes.sizeof(amdgpu_drm.struct_drm_amdgpu_bo_list_entry),
+      bo_info_ptr=ctypes.addressof(entries))).out.list_handle
+
+  def _va(self, handle:int, addr:int, size:int, op:int, uncached=False):
+    flags = amdgpu_drm.AMDGPU_VM_PAGE_READABLE | amdgpu_drm.AMDGPU_VM_PAGE_WRITEABLE | amdgpu_drm.AMDGPU_VM_PAGE_EXECUTABLE
+    amdgpu_drm.DRM_IOCTL_AMDGPU_GEM_VA(self.fd, handle=handle, operation=op, va_address=addr, map_size=size,
+                                       flags=flags | (amdgpu_drm.AMDGPU_VM_MTYPE_UC if uncached else 0) if op == amdgpu_drm.AMDGPU_VA_OP_MAP else 0)
+
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, cpu_addr=None) -> BufferStorage:
+    size = round_up(size, mmap.PAGESIZE)
+    if cpu_addr is not None: return self._userptr(cpu_addr, size)
+    flags = amdgpu_drm.AMDGPU_GEM_CREATE_VM_ALWAYS_VALID | amdgpu_drm.AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | \
+            (amdgpu_drm.AMDGPU_GEM_CREATE_CPU_GTT_USWC if uncached else 0)
+    try: handle = amdgpu_drm.DRM_IOCTL_AMDGPU_GEM_CREATE(self.fd, _in=amdgpu_drm.struct_drm_amdgpu_gem_create_in(bo_size=size,
+                   alignment=mmap.PAGESIZE, domains=amdgpu_drm.AMDGPU_GEM_DOMAIN_GTT, domain_flags=flags)).out.handle
+    except OSError as e: raise MemoryError(f"Cannot allocate {size} bytes: {e}") from e
+    addr = FileIOInterface.anon_mmap(0, size, 0, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_NORESERVE, 0) # the gpu uses the cpu address
+    offset = amdgpu_drm.DRM_IOCTL_AMDGPU_GEM_MMAP(self.fd, _in=amdgpu_drm.struct_drm_amdgpu_gem_mmap_in(handle=handle)).out.addr_ptr
+    assert self.fd.mmap(addr, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | MAP_FIXED, offset) == addr
+    self._va(handle, addr, size, amdgpu_drm.AMDGPU_VA_OP_MAP, uncached)
+    return BufferStorage(addr, (handle, size, False), MMIOInterface(addr, size, fmt='B') if cpu_access or host else None)
+
+  def _userptr(self, addr:int, size:int) -> BufferStorage:
+    handle = amdgpu_drm.DRM_IOCTL_AMDGPU_GEM_USERPTR(self.fd, addr=addr, size=size,
+                                                     flags=amdgpu_drm.AMDGPU_GEM_USERPTR_REGISTER | amdgpu_drm.AMDGPU_GEM_USERPTR_VALIDATE).handle
+    self._va(handle, addr, size, amdgpu_drm.AMDGPU_VA_OP_MAP)
+    self.userptrs.add(handle)
+    self._bo_list(amdgpu_drm.AMDGPU_BO_LIST_OP_UPDATE, self.bo_list)
+    return BufferStorage(addr, (handle, size, True))
+
+  def free(self, storage:BufferStorage):
+    handle, size, userptr = storage.meta
+    self._va(handle, storage.buf, size, amdgpu_drm.AMDGPU_VA_OP_UNMAP)
+    if userptr:
+      self.userptrs.discard(handle)
+      self._bo_list(amdgpu_drm.AMDGPU_BO_LIST_OP_UPDATE, self.bo_list)
+    else: FileIOInterface.munmap(storage.buf, size)
+    amdgpu_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=handle)
+
+  def map(self, buf:Buffer) -> BufferStorage: # one vm: gpu buffers are mapped already, host ones become userptrs
+    if buf.device.split(":")[0] not in {"CPU", "PYTHON", "NPY"}: return BufferStorage(buf._buf, None)
+    if buf._buf % mmap.PAGESIZE: raise RuntimeError("Host mapping requires a page-aligned address")
+    return self._userptr(buf._buf, round_up(buf.nbytes, mmap.PAGESIZE))
+  def unmap(self, mapping:BufferStorage):
+    if mapping.meta is not None: self.free(mapping)
+
+  def create_queue(self, queue_type, ring, gart, rptr, wptr, eop_buffer=None, cwsr_buffer=None, ctl_stack_size=0, ctx_save_restore_size=0,
+                   xcc_id=0, idx=0): # the kernel owns the rings: the descriptor only names the queue
+    (put_value := Buffer("CPU", 8, preallocate=True)).host.view(fmt='Q')[0] = 0
+    return AMDQueueDesc(ring=ring, read_ptr=gart.view(8, rptr).ensure_allocated(), write_ptr=gart.view(8, wptr).ensure_allocated(),
+                        doorbell=put_value, put_value=put_value)
+
+  def sleep(self, tm:int): time.sleep(0.0005)
+
+  def on_device_hang(self):
+    st = amdgpu_drm.DRM_IOCTL_AMDGPU_CTX(self.fd, _in=amdgpu_drm.struct_drm_amdgpu_ctx_in(op=amdgpu_drm.AMDGPU_CTX_OP_QUERY_STATE2,
+                                                                                        ctx_id=self.ctx_id)).out.state
+    raise RuntimeError(f"AMD (drm) job failed: context state flags=0x{st.flags:x} hangs={st.hangs} reset_status={st.reset_status}")
+
+  def require_profile_mode(self): return True
+  def is_wgp_active(self, xcc, se, sa, wgp) -> bool: return True
+
 class PCIIface(PCIIfaceBase):
   def __init__(self, dev, dev_id):
     pci_ids = {"gfx1100": (0X744C,), "gfx1102": (0x7480,), "gfx1201": (0x7550, 0x7551), "gfx1200": (0x7590,),
@@ -850,7 +973,7 @@ class AMDDevice(Compiled):
   sleep_timeout_ms = 200
   max_scratch_psize = 0
 
-  ifaces = [KFDIface, PCIIface, USBIface, _mock(KFDIface, "MOCKIface"), _mock(KFDIface), _mock(PCIIface), _mock(USBIface)]
+  ifaces = [KFDIface, PCIIface, USBIface, DRMIface, _mock(KFDIface, "MOCKIface"), _mock(KFDIface), _mock(PCIIface), _mock(USBIface)]
 
   def device_props(self): return self.iface.props
 
@@ -900,6 +1023,7 @@ class AMDDevice(Compiled):
     names = ("ring", "write_ptr", "doorbell", "put_value")
     Compiled.link_bufs |= {to_name(self.device, n, q): lambda b, n=n, f=f: getattr(f(), n) for q, f in queues.items() for n in names}
     Compiled.link_bufs |= {to_name(self.device, "scratch"): lambda b: self.scratch_buffer(b.max_numel())}
+    Compiled.link_bufs |= {to_name(self.device, "drm_err"): lambda b: self.error_state}
     if self.is_usb: setup_usb_rules(self)
 
     # SQTT is disabled by default because of runtime overhead and big file sizes (~200mb to Tensor.full() two 4096x4096 tensors and matmul them)
