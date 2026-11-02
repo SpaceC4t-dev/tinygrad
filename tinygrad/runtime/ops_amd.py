@@ -468,8 +468,9 @@ class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets:
 
 class AMDCPCopyQueue(AMDComputeQueue): # copies with cp dma on a compute queue, for when no sdma queue is left
   def copy(self, dst:UOp, src:UOp, sz:int):
-    for off in range(0, sz, chunk:=1 << 20): # through the L2, like the kernels. cp_sync: the next packet waits for the copy
-      ctrl = self.pm4.PACKET3_DMA_DATA_SRC_SEL(3) | self.pm4.PACKET3_DMA_DATA_DST_SEL(3) | self.pm4.PACKET3_DMA_DATA_CP_SYNC
+    for off in range(0, sz, chunk:=1 << 16): # through the L2, like the kernels. cp_sync on the last: what follows waits for the copy
+      ctrl = self.pm4.PACKET3_DMA_DATA_SRC_SEL(3) | self.pm4.PACKET3_DMA_DATA_DST_SEL(3)
+      if off + chunk >= sz: ctrl |= self.pm4.PACKET3_DMA_DATA_CP_SYNC
       addrs = (a + UOp.const(off, dtypes.uint64) if off else a for a in (src.getaddr(self.devs), dst.getaddr(self.devs)))
       self.pkt3(self.pm4.PACKET3_DMA_DATA, ctrl, *addrs, min(sz - off, chunk))
 
@@ -946,16 +947,15 @@ class AMDDevice(Compiled):
              ctx_save_restore_size=ctx_save_restore_size, ctl_stack_size=ctl_stack_size, idx=idx)
 
   @functools.cached_property
-  def compute_queue(self) -> AMDQueueDesc: return self._create_compute_queue(bool(self.is_aql), (1 << 20) if self.is_usb else (16 << 20))
-
-  def _create_compute_queue(self, aql:bool, ring_size:int) -> AMDQueueDesc:
+  def compute_queue(self) -> AMDQueueDesc:
     # https://gitlab.freedesktop.org/agd5f/linux/-/blob/a1fc9f584c4aaf8bc1ebfa459fc57a3f26a290d8/drivers/gpu/drm/amd/amdkfd/kfd_queue.c#L391
     sgrp_size_per_cu, hwreg_size_per_cu = 0x4000, 0x1000
     lds_size_per_cu = self.iface.props["lds_size_in_kb"] << 10 if self.target[:2] == (9,5) else 0x10000
     vgpr_size_per_cu = 0x60000 if self.target in {(11,0,0), (11,0,1), (11,5,1), (12,0,0), (12,0,1)} else 0x80000 if self.target[0] == 9 else 0x40000
     wg_data_size = round_up((vgpr_size_per_cu + sgrp_size_per_cu + lds_size_per_cu + hwreg_size_per_cu) * self.cu_cnt, mmap.PAGESIZE)
     ctl_stack_size = round_up((12 if self.target[0] != 9 else 8) * self.wave_cnt + 8 + 40, mmap.PAGESIZE)
-    return self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_COMPUTE_AQL if aql else kfd.KFD_IOC_QUEUE_TYPE_COMPUTE, ring_size, eop_buffer_size=0x1000,
+    return self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_COMPUTE_AQL if self.is_aql else kfd.KFD_IOC_QUEUE_TYPE_COMPUTE,
+      (1 << 20) if self.is_usb else (16 << 20), eop_buffer_size=0x1000,
       ctx_save_restore_size=0 if self.is_am() else wg_data_size + ctl_stack_size, ctl_stack_size=ctl_stack_size,
       debug_memory_size=round_up(self.wave_cnt * 32, 64))
 
@@ -969,9 +969,10 @@ class AMDDevice(Compiled):
     if idx in self.sdma_queues: return self.sdma_queues[idx]
     with contextlib.suppress(OSError):
       self.sdma_queues[idx] = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 16 << 20, idx=idx)
-    # renoir has 2 sdma queues for the whole system: copy on a compute queue (cp dma) instead of falling back to no copy queue
-    if idx not in self.sdma_queues and self.target == (9,0,12) and not self.is_am():
-      self.sdma_queues[idx] = replace(self._create_compute_queue(False, 1 << 20), cp_copy=True)
+    # renoir has 2 sdma queues for the whole system: copy with cp dma instead of falling back to no copy queue. on the compute
+    # queue's own ring: two compute queues waiting on each other can't be preempted (kfd resets them), one ring runs in order
+    if idx not in self.sdma_queues and self.target == (9,0,12) and not self.is_am() and not self.is_aql:
+      self.sdma_queues[idx] = replace(self.compute_queue, cp_copy=True)
     return self.sdma_queues.get(idx, None)
 
   def tmpring_size(self, private_segment_size):
