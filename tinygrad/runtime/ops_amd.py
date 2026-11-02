@@ -369,6 +369,7 @@ class AMDComputeQueue(HWQueue):
     if not data.kernargs_segment_size and not data.enable_dispatch_ptr: return UOp.const(0, dtypes.uint64) # no kernargs, nothing to point at
     args = get_call_kernel_args(call, prg, self.devs)
     words = pack_args(layout_args(args), data.kernargs_segment_size) + (dispatch_packet(data, prg.arg) if data.enable_dispatch_ptr else [])
+    words = [UOp.const(w, dtypes.uint32) if isinstance(w, int) else w for w in words] # a static grid is plain ints
     return UOp(Ops.LINEAR, src=tuple(words), arg="kernargs").getaddr(self.devs)
 
   def exec(self, call:UOp, prg:UOp):
