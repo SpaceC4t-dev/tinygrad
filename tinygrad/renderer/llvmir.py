@@ -304,6 +304,9 @@ exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc
       (UPat(Ops.WMMA, name="wmma"), lambda ctx, wmma, rdna4=AMDLLVMRenderer.is_rdna4(target.arch), cdna=self.is_cdna:
         render_wmma_amd(ctx, wmma, cdna, rdna4))
     ])
+    if target.arch == "gfx90c": # gfx9's fast rcp is ~1ulp off, so exact quotients (6/-3) can round wrong: use the ieee fdiv
+      self.string_rewrite = PatternMatcher([(UPat(Ops.FDIV, dtype=dtypes.floats, name="x"), lambda ctx,x:
+        f"  {ctx[x]} = fdiv contract {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ctx[x.src[1]]}")]) + self.string_rewrite
     self.extra_matcher = self.extra_matcher + create_non_native_float_pats(dtypes.fp8s) + PatternMatcher([
       # amd llvm intrinsics llvm.log2/llvm.exp2 don't support double
       (UPat(Ops.LOG2, dtype=dtypes.double, src=(UPat.var("d"),)), xlog2),
